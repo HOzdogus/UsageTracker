@@ -18,6 +18,10 @@ data class AppUsage(
     val icon: Bitmap?,
     val foregroundMs: Long,
     val opens: Int,
+    /** Time on screen in each hour of the day, index 0 = midnight to 1am. */
+    val hourlyMs: List<Long>,
+    /** How many times it was opened in each hour of the day. */
+    val hourlyOpens: List<Int>,
 )
 
 data class DayUsage(
@@ -68,11 +72,46 @@ class UsageRepository(private val context: Context) {
         val totals = HashMap<String, Long>()
         val opens = HashMap<String, Int>()
         val seen = HashSet<String>()
+        val hourlyTime = HashMap<String, LongArray>()
+        val hourlyOpenCounts = HashMap<String, IntArray>()
+
+        // The start of every hour in this day. Stepping by real hours means the
+        // clock-change days (23 or 25 hours long) still land in the right slots.
+        val hourStarts = ArrayList<Long>()
+        val hourLabels = ArrayList<Int>()
+        val nextMidnight = date.plusDays(1).atStartOfDay(zone)
+        var cursor = date.atStartOfDay(zone)
+        while (cursor.isBefore(nextMidnight)) {
+            hourStarts.add(cursor.toInstant().toEpochMilli())
+            hourLabels.add(cursor.hour)
+            cursor = cursor.plusHours(1)
+        }
+
+        fun hourOf(ts: Long): Int {
+            var hour = 0
+            for (i in hourStarts.indices) {
+                if (ts >= hourStarts[i]) hour = hourLabels[i]
+            }
+            return hour
+        }
 
         fun addTime(pkg: String, from: Long, to: Long) {
             val start = maxOf(from, dayStart)
             val end = minOf(to, windowEnd)
-            if (end > start) totals[pkg] = (totals[pkg] ?: 0L) + (end - start)
+            if (end <= start) return
+            totals[pkg] = (totals[pkg] ?: 0L) + (end - start)
+
+            // Split the stretch across the hours it covers.
+            val perHour = hourlyTime.getOrPut(pkg) { LongArray(24) }
+            for (i in hourStarts.indices) {
+                val slotStart = hourStarts[i]
+                val slotEnd = if (i + 1 < hourStarts.size) hourStarts[i + 1] else dayEnd
+                val overlapStart = maxOf(start, slotStart)
+                val overlapEnd = minOf(end, slotEnd)
+                if (overlapEnd > overlapStart) {
+                    perHour[hourLabels[i]] += overlapEnd - overlapStart
+                }
+            }
         }
 
         fun closeAll(at: Long) {
@@ -94,7 +133,10 @@ class UsageRepository(private val context: Context) {
                     val set = resumedActivities.getOrPut(pkg) { mutableSetOf() }
                     if (set.isEmpty()) {
                         foregroundSince[pkg] = ts
-                        if (ts >= dayStart) opens[pkg] = (opens[pkg] ?: 0) + 1
+                        if (ts >= dayStart) {
+                            opens[pkg] = (opens[pkg] ?: 0) + 1
+                            hourlyOpenCounts.getOrPut(pkg) { IntArray(24) }[hourOf(ts)] += 1
+                        }
                     }
                     set.add(cls)
                 }
@@ -133,6 +175,8 @@ class UsageRepository(private val context: Context) {
                     icon = iconFor(pkg),
                     foregroundMs = ms,
                     opens = opens[pkg] ?: 0,
+                    hourlyMs = (hourlyTime[pkg] ?: LongArray(24)).toList(),
+                    hourlyOpens = (hourlyOpenCounts[pkg] ?: IntArray(24)).toList(),
                 )
             }
             .sortedByDescending { it.foregroundMs }
