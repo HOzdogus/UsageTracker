@@ -2,14 +2,17 @@ package com.screentime.tracker.ui
 
 import android.content.Intent
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material3.*
@@ -53,6 +56,7 @@ fun ScreenTimeApp(repo: UsageRepository) {
             var date by remember { mutableStateOf(LocalDate.now()) }
             var day by remember { mutableStateOf<DayUsage?>(null) }
             var refreshTick by remember { mutableIntStateOf(0) }
+            var selectedPkg by remember { mutableStateOf<String?>(null) }
 
             // Re-check permission and refresh numbers every time you come back to the app.
             LifecycleResumeEffect(Unit) {
@@ -67,14 +71,27 @@ fun ScreenTimeApp(repo: UsageRepository) {
                 }
             }
 
+            val shownDay = day?.takeIf { it.date == date }
+            val selectedApp = shownDay?.apps?.find { it.packageName == selectedPkg }
+
+            // The phone's back gesture closes the hourly view instead of the app.
+            BackHandler(enabled = selectedApp != null) { selectedPkg = null }
+
             if (!hasPermission) {
                 PermissionScreen()
+            } else if (selectedPkg != null && selectedApp != null) {
+                AppDetailScreen(
+                    app = selectedApp,
+                    dateLabel = dateLabelFor(date),
+                    onBack = { selectedPkg = null },
+                )
             } else {
                 UsageScreen(
                     date = date,
-                    day = day?.takeIf { it.date == date },
+                    day = shownDay,
                     onPrev = { date = date.minusDays(1) },
                     onNext = { if (date < LocalDate.now()) date = date.plusDays(1) },
+                    onAppClick = { selectedPkg = it.packageName },
                 )
             }
         }
@@ -115,13 +132,10 @@ private fun UsageScreen(
     day: DayUsage?,
     onPrev: () -> Unit,
     onNext: () -> Unit,
+    onAppClick: (AppUsage) -> Unit,
 ) {
     val today = LocalDate.now()
-    val dateLabel = when (date) {
-        today -> "Today"
-        today.minusDays(1) -> "Yesterday"
-        else -> date.format(DateTimeFormatter.ofPattern("EEE d MMM"))
-    }
+    val dateLabel = dateLabelFor(date)
 
     LazyColumn(
         Modifier.fillMaxSize().statusBarsPadding(),
@@ -161,7 +175,11 @@ private fun UsageScreen(
         } else {
             val max = day.apps.first().foregroundMs
             items(day.apps, key = { it.packageName }) { app ->
-                AppRow(app, fraction = app.foregroundMs.toFloat() / max)
+                AppRow(
+                    app,
+                    fraction = app.foregroundMs.toFloat() / max,
+                    onClick = { onAppClick(app) },
+                )
             }
         }
     }
@@ -194,10 +212,11 @@ private fun SummaryCard(day: DayUsage?) {
 }
 
 @Composable
-private fun AppRow(app: AppUsage, fraction: Float) {
+private fun AppRow(app: AppUsage, fraction: Float, onClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
             .background(Card)
             .padding(14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -230,6 +249,172 @@ private fun AppRow(app: AppUsage, fraction: Float) {
             Spacer(Modifier.height(6.dp))
             Text(
                 if (app.opens == 1) "Opened once" else "Opened ${app.opens} times",
+                color = Muted, fontSize = 12.sp,
+            )
+        }
+    }
+}
+
+private fun dateLabelFor(date: LocalDate): String {
+    val today = LocalDate.now()
+    return when (date) {
+        today -> "Today"
+        today.minusDays(1) -> "Yesterday"
+        else -> date.format(DateTimeFormatter.ofPattern("EEE d MMM"))
+    }
+}
+
+/** Like formatDuration, but shows seconds for very short stretches. */
+private fun formatShort(ms: Long): String =
+    if (ms < 60_000) "${ms / 1000}s" else formatDuration(ms)
+
+private fun hourRange(hour: Int): String =
+    "%02d:00 – %02d:00".format(hour, (hour + 1) % 24)
+
+@Composable
+private fun AppDetailScreen(app: AppUsage, dateLabel: String, onBack: () -> Unit) {
+    val usedHours = (0 until 24).filter { app.hourlyMs[it] > 0 || app.hourlyOpens[it] > 0 }
+    val peakHour = (0 until 24).maxByOrNull { app.hourlyMs[it] } ?: 0
+    val maxMs = app.hourlyMs.maxOrNull() ?: 0L
+
+    LazyColumn(
+        Modifier.fillMaxSize().statusBarsPadding(),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                }
+                Text(dateLabel, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        item {
+            Column(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Card)
+                    .padding(20.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (app.icon != null) {
+                        Image(
+                            app.icon.asImageBitmap(), null,
+                            Modifier.size(44.dp).clip(RoundedCornerShape(11.dp)),
+                        )
+                    } else {
+                        Box(Modifier.size(44.dp).clip(CircleShape).background(Track))
+                    }
+                    Spacer(Modifier.width(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            app.label, fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            if (app.opens == 1) "Opened once" else "Opened ${app.opens} times",
+                            color = Muted, fontSize = 13.sp,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(formatDuration(app.foregroundMs), fontSize = 36.sp, fontWeight = FontWeight.Bold)
+                if (maxMs > 0) {
+                    Text("Most used ${hourRange(peakHour)}", color = Muted, fontSize = 14.sp)
+                }
+                Spacer(Modifier.height(18.dp))
+                HourChart(app.hourlyMs, peakHour)
+            }
+        }
+
+        if (usedHours.isEmpty()) {
+            item {
+                Text(
+                    "No time recorded in any hour of this day.",
+                    color = Muted, modifier = Modifier.padding(vertical = 16.dp),
+                )
+            }
+        } else {
+            item {
+                Text(
+                    "Hour by hour", color = Muted, fontSize = 13.sp,
+                    modifier = Modifier.padding(top = 6.dp, start = 4.dp),
+                )
+            }
+            items(usedHours, key = { it }) { hour ->
+                HourRow(
+                    hour = hour,
+                    ms = app.hourlyMs[hour],
+                    opens = app.hourlyOpens[hour],
+                    fraction = if (maxMs > 0) app.hourlyMs[hour].toFloat() / maxMs else 0f,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HourChart(hourlyMs: List<Long>, peakHour: Int) {
+    val maxMs = hourlyMs.maxOrNull() ?: 0L
+    Row(
+        Modifier.fillMaxWidth().height(120.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        for (hour in 0 until 24) {
+            val ms = hourlyMs[hour]
+            Box(
+                Modifier.weight(1f).fillMaxHeight(),
+                contentAlignment = Alignment.BottomCenter,
+            ) {
+                if (ms > 0 && maxMs > 0) {
+                    val fraction = (ms.toFloat() / maxMs).coerceIn(0.04f, 1f)
+                    Box(
+                        Modifier.fillMaxWidth()
+                            .fillMaxHeight(fraction)
+                            .clip(RoundedCornerShape(topStart = 3.dp, topEnd = 3.dp))
+                            .background(if (hour == peakHour) Accent else Accent.copy(alpha = 0.5f))
+                    )
+                } else {
+                    Box(Modifier.fillMaxWidth().height(2.dp).background(Track))
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+    Row(Modifier.fillMaxWidth()) {
+        listOf("00", "06", "12", "18").forEach { label ->
+            Text(label, Modifier.weight(1f), color = Muted, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+private fun HourRow(hour: Int, ms: Long, opens: Int, fraction: Float) {
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Card)
+            .padding(horizontal = 14.dp, vertical = 12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(hourRange(hour), Modifier.weight(1f), fontWeight = FontWeight.Medium)
+            Text(formatShort(ms), fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(8.dp))
+        Box(Modifier.fillMaxWidth().height(5.dp).clip(CircleShape).background(Track)) {
+            if (fraction > 0f) {
+                Box(
+                    Modifier.fillMaxWidth(fraction.coerceIn(0.02f, 1f))
+                        .fillMaxHeight().clip(CircleShape).background(Accent)
+                )
+            }
+        }
+        if (opens > 0) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (opens == 1) "Opened once" else "Opened $opens times",
                 color = Muted, fontSize = 12.sp,
             )
         }
