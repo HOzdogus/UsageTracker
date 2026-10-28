@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ScreenTime"
 include(":app")
+include(":backlog")
