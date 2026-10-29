@@ -9,6 +9,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repo = UsageRepository(applicationContext)
-        setContent { ScreenTimeApp(repo) }
+        val storageRepo = StorageRepository(applicationContext)
+        setContent { ScreenTimeApp(repo, storageRepo) }
     }
 }

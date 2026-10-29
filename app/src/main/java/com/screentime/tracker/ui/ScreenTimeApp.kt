@@ -29,7 +29,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.screentime.tracker.AppUsage
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.screentime.tracker.DayUsage
+import com.screentime.tracker.StorageOverview
+import com.screentime.tracker.StorageRepository
 import com.screentime.tracker.UsageRepository
 import com.screentime.tracker.formatDuration
 import kotlinx.coroutines.Dispatchers
@@ -37,11 +40,11 @@ import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
-private val Bg = Color(0xFF0F1115)
-private val Card = Color(0xFF181C24)
-private val Accent = Color(0xFF7CE0B8)
-private val Muted = Color(0xFF8A93A6)
-private val Track = Color(0xFF262B36)
+internal val Bg = Color(0xFF0F1115)
+internal val Card = Color(0xFF181C24)
+internal val Accent = Color(0xFF7CE0B8)
+internal val Muted = Color(0xFF8A93A6)
+internal val Track = Color(0xFF262B36)
 
 private val colors = darkColorScheme(
     background = Bg, surface = Card, primary = Accent,
@@ -49,9 +52,12 @@ private val colors = darkColorScheme(
 )
 
 @Composable
-fun ScreenTimeApp(repo: UsageRepository) {
+fun ScreenTimeApp(repo: UsageRepository, storageRepo: StorageRepository) {
     MaterialTheme(colorScheme = colors) {
         Surface(Modifier.fillMaxSize(), color = Bg) {
+            var tab by rememberSaveable { mutableIntStateOf(0) }
+            var storage by remember { mutableStateOf<StorageOverview?>(null) }
+            var storageTick by remember { mutableIntStateOf(0) }
             var hasPermission by remember { mutableStateOf(repo.hasPermission()) }
             var date by remember { mutableStateOf(LocalDate.now()) }
             var day by remember { mutableStateOf<DayUsage?>(null) }
@@ -77,22 +83,53 @@ fun ScreenTimeApp(repo: UsageRepository) {
             // The phone's back gesture closes the hourly view instead of the app.
             BackHandler(enabled = selectedApp != null) { selectedPkg = null }
 
+            // Storage tab: loaded when you open it, and again on refresh or when you come back.
+            LaunchedEffect(hasPermission, tab, refreshTick, storageTick) {
+                if (hasPermission && tab == 1) {
+                    storage = withContext(Dispatchers.IO) {
+                        runCatching { storageRepo.loadOverview() }.getOrNull()
+                    } ?: storage
+                }
+            }
+
             if (!hasPermission) {
                 PermissionScreen()
-            } else if (selectedPkg != null && selectedApp != null) {
-                AppDetailScreen(
-                    app = selectedApp,
-                    dateLabel = dateLabelFor(date),
-                    onBack = { selectedPkg = null },
-                )
+            } else if (tab == 0 && selectedPkg != null && selectedApp != null) {
+                Box(Modifier.statusBarsPadding()) {
+                    AppDetailScreen(
+                        app = selectedApp,
+                        dateLabel = dateLabelFor(date),
+                        onBack = { selectedPkg = null },
+                    )
+                }
             } else {
-                UsageScreen(
-                    date = date,
-                    day = shownDay,
-                    onPrev = { date = date.minusDays(1) },
-                    onNext = { if (date < LocalDate.now()) date = date.plusDays(1) },
-                    onAppClick = { selectedPkg = it.packageName },
-                )
+                Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                    TabRow(
+                        selectedTabIndex = tab,
+                        containerColor = Bg,
+                        contentColor = Color.White,
+                    ) {
+                        Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Screen time") })
+                        Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Storage") })
+                    }
+                    Box(Modifier.weight(1f)) {
+                        if (tab == 0) {
+                            UsageScreen(
+                                date = date,
+                                day = shownDay,
+                                onPrev = { date = date.minusDays(1) },
+                                onNext = { if (date < LocalDate.now()) date = date.plusDays(1) },
+                                onAppClick = { selectedPkg = it.packageName },
+                            )
+                        } else {
+                            StorageTab(
+                                repo = storageRepo,
+                                overview = storage,
+                                onRefresh = { storageTick++ },
+                            )
+                        }
+                    }
+                }
             }
         }
     }

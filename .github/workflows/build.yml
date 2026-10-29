@@ -5,7 +5,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'try/**'] # try/ branches build test APKs without touching main
   workflow_dispatch: # adds a "Run workflow" button on the Actions tab
 
 permissions:
