@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lets the folder browser hand any file in shared storage to another app to open. -->
+<paths>
+    <external-path name="storage" path="." />
+</paths>

@@ -12,6 +12,18 @@ import android.os.Process
 import android.os.storage.StorageManager
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toBitmap
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
+import android.media.MediaScannerConnection
+import android.media.ThumbnailUtils
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.util.Size
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import java.io.File
 import java.nio.file.Files
 import java.util.Locale
@@ -50,6 +62,12 @@ data class FolderItem(
     /** Number of files inside (1 for a plain file). */
     val fileCount: Int,
 )
+
+sealed interface FilePreview {
+    data class Picture(val bitmap: Bitmap) : FilePreview
+    data class TextSnippet(val text: String, val truncated: Boolean) : FilePreview
+    data object Unavailable : FilePreview
+}
 
 data class FolderListing(
     val dir: File,
@@ -191,6 +209,128 @@ class StorageRepository(private val context: Context) {
             lockedFolders = locked,
         )
     }
+
+    // ---------- File preview / open / delete ----------
+
+    fun mimeTypeOf(file: File): String =
+        MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(file.extension.lowercase(Locale.ROOT))
+            ?: when (file.extension.lowercase(Locale.ROOT)) {
+                in textExtensions -> "text/plain"
+                else -> "*/*"
+            }
+
+    /** Builds a small preview: a thumbnail for images, videos, PDFs and music, or the start of a text file. */
+    fun previewFor(file: File): FilePreview {
+        val mime = mimeTypeOf(file)
+        val ext = file.extension.lowercase(Locale.ROOT)
+        val size = Size(720, 720)
+        return try {
+            when {
+                mime.startsWith("image/") -> {
+                    val bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ThumbnailUtils.createImageThumbnail(file, size, null)
+                    } else {
+                        decodeSampled(file, 720)
+                    }
+                    bmp?.let { FilePreview.Picture(it) } ?: FilePreview.Unavailable
+                }
+                mime.startsWith("video/") -> {
+                    val bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ThumbnailUtils.createVideoThumbnail(file, size, null)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        ThumbnailUtils.createVideoThumbnail(
+                            file.absolutePath, MediaStore.Images.Thumbnails.MINI_KIND
+                        )
+                    }
+                    bmp?.let { FilePreview.Picture(it) } ?: FilePreview.Unavailable
+                }
+                mime.startsWith("audio/") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ->
+                    FilePreview.Picture(ThumbnailUtils.createAudioThumbnail(file, size, null))
+                mime == "application/pdf" -> renderPdfFirstPage(file)
+                mime.startsWith("text/") || ext in textExtensions -> {
+                    val limit = 4000
+                    val bytes = file.inputStream().use { input ->
+                        val buf = ByteArray(limit)
+                        var read = 0
+                        while (read < limit) {
+                            val n = input.read(buf, read, limit - read)
+                            if (n < 0) break
+                            read += n
+                        }
+                        buf.copyOf(read)
+                    }
+                    FilePreview.TextSnippet(String(bytes, Charsets.UTF_8), file.length() > limit)
+                }
+                else -> FilePreview.Unavailable
+            }
+        } catch (_: Exception) {
+            // No album art, unreadable file, unsupported format, etc.
+            FilePreview.Unavailable
+        }
+    }
+
+    /** Hands the file to another app (Gallery, a PDF viewer, a video player…). False if nothing can open it. */
+    fun openExternally(file: File): Boolean {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        val view = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, mimeTypeOf(file))
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        return try {
+            context.startActivity(
+                Intent.createChooser(view, "Open with").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        }
+    }
+
+    /** Deletes the file and tells the media library so Gallery etc. stop showing it. */
+    fun deleteFile(file: File): Boolean {
+        val ok = file.delete()
+        if (ok) MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
+        return ok
+    }
+
+    private fun decodeSampled(file: File, target: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= target && bounds.outHeight / (sample * 2) >= target) {
+            sample *= 2
+        }
+        return BitmapFactory.decodeFile(
+            file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample }
+        )
+    }
+
+    private fun renderPdfFirstPage(file: File): FilePreview {
+        val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        val renderer = PdfRenderer(fd) // closes fd when it is closed
+        try {
+            if (renderer.pageCount == 0) return FilePreview.Unavailable
+            val page = renderer.openPage(0)
+            try {
+                val width = 720
+                val height = (width.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
+                val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(Color.WHITE)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                return FilePreview.Picture(bmp)
+            } finally {
+                page.close()
+            }
+        } finally {
+            renderer.close()
+        }
+    }
+
+    private val textExtensions = setOf(
+        "txt", "log", "json", "xml", "md", "csv", "ini", "cfg", "conf", "yaml", "yml",
+        "srt", "properties", "html", "htm", "kt", "java", "py", "js", "sh",
+    )
 
     private fun isLink(f: File): Boolean = try {
         Files.isSymbolicLink(f.toPath())

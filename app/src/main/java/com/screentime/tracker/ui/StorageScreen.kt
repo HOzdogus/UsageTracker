@@ -35,7 +35,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import android.widget.Toast
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontFamily
 import com.screentime.tracker.AppStorage
+import com.screentime.tracker.FilePreview
+import com.screentime.tracker.FolderItem
 import com.screentime.tracker.FolderListing
 import com.screentime.tracker.StorageOverview
 import com.screentime.tracker.StorageRepository
@@ -43,6 +48,8 @@ import com.screentime.tracker.formatBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.DateFormat
+import java.util.Date
 
 private val CategoryColors = listOf(
     Color(0xFF7CE0B8), // Apps
@@ -70,6 +77,7 @@ fun StorageTab(
             dir = folderStack.last(),
             onBack = { folderStack = folderStack.dropLast(1) },
             onOpen = { folderStack = folderStack + it },
+            onChanged = onRefresh,
         )
     } else {
         StorageOverviewScreen(
@@ -334,10 +342,26 @@ private fun FolderScreen(
     dir: File,
     onBack: () -> Unit,
     onOpen: (File) -> Unit,
+    onChanged: () -> Unit,
 ) {
     var listing by remember(dir) { mutableStateOf<FolderListing?>(null) }
-    LaunchedEffect(dir) {
+    var rescanTick by remember(dir) { mutableIntStateOf(0) }
+    var selected by remember(dir) { mutableStateOf<FolderItem?>(null) }
+    LaunchedEffect(dir, rescanTick) {
         listing = withContext(Dispatchers.IO) { repo.scanFolder(dir) }
+    }
+
+    selected?.let { file ->
+        FileDialog(
+            repo = repo,
+            item = file,
+            onDismiss = { selected = null },
+            onDeleted = {
+                selected = null
+                rescanTick++
+                onChanged()
+            },
+        )
     }
 
     val rootPath = repo.storageRoot.absolutePath
@@ -414,7 +438,13 @@ private fun FolderScreen(
                 } else "File",
                 fraction = item.bytes.toFloat() / max,
                 isDirectory = item.isDirectory,
-                onClick = if (item.isDirectory) ({ onOpen(item.file) }) else null,
+                onClick = {
+                    if (item.isDirectory) {
+                        onOpen(item.file)
+                    } else {
+                        selected = item
+                    }
+                },
             )
         }
 
@@ -435,7 +465,7 @@ private fun FolderScreen(
                     subtitle = if (parent.isEmpty()) "In this folder" else parent,
                     fraction = item.bytes.toFloat() / maxFile,
                     isDirectory = false,
-                    onClick = null,
+                    onClick = { selected = item },
                 )
             }
         }
@@ -481,9 +511,122 @@ private fun FolderRow(
             Spacer(Modifier.height(6.dp))
             Text(subtitle, color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        if (onClick != null) {
+        if (isDirectory) {
             Spacer(Modifier.width(6.dp))
             Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Muted)
         }
     }
+}
+
+private val DangerRed = Color(0xFFFF6B6B)
+
+/** Tapping a file: shows a preview and lets you open it in another app or delete it. */
+@Composable
+private fun FileDialog(
+    repo: StorageRepository,
+    item: FolderItem,
+    onDismiss: () -> Unit,
+    onDeleted: () -> Unit,
+) {
+    val context = LocalContext.current
+    val file = item.file
+    var preview by remember(file) { mutableStateOf<FilePreview?>(null) }
+    var confirmDelete by remember(file) { mutableStateOf(false) }
+    LaunchedEffect(file) {
+        preview = withContext(Dispatchers.IO) { repo.previewFor(file) }
+    }
+
+    val location = file.parentFile?.absolutePath
+        ?.removePrefix(repo.storageRoot.absolutePath)?.trimStart('/')
+        ?.ifEmpty { null }
+        ?.let { "Internal storage/$it" } ?: "Internal storage"
+    val modified = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+        .format(Date(file.lastModified()))
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            containerColor = Card,
+            title = { Text("Delete this file?") },
+            text = {
+                Text(
+                    "${file.name} (${formatBytes(item.bytes)}) will be permanently deleted. " +
+                        "This can't be undone.",
+                    color = Muted,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (repo.deleteFile(file)) {
+                        Toast.makeText(context, "Deleted ${file.name}", Toast.LENGTH_SHORT).show()
+                        onDeleted()
+                    } else {
+                        Toast.makeText(context, "Couldn't delete ${file.name}", Toast.LENGTH_SHORT).show()
+                        confirmDelete = false
+                    }
+                }) { Text("Delete", color = DangerRed, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Card,
+        title = {
+            Text(file.name, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 18.sp)
+        },
+        text = {
+            Column {
+                when (val p = preview) {
+                    null -> Box(Modifier.fillMaxWidth().height(160.dp), Alignment.Center) {
+                        CircularProgressIndicator(color = Accent)
+                    }
+                    is FilePreview.Picture -> Image(
+                        p.bitmap.asImageBitmap(), null,
+                        Modifier.fillMaxWidth().heightIn(max = 300.dp).clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Fit,
+                    )
+                    is FilePreview.TextSnippet -> Text(
+                        p.text + if (p.truncated) "\n…" else "",
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Bg)
+                            .padding(10.dp),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        maxLines = 14,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    FilePreview.Unavailable -> Box(
+                        Modifier.fillMaxWidth().height(72.dp)
+                            .clip(RoundedCornerShape(12.dp)).background(Bg),
+                        Alignment.Center,
+                    ) {
+                        Text("No preview for this type of file", color = Muted, fontSize = 13.sp)
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+                Text(formatBytes(item.bytes), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("Modified $modified", color = Muted, fontSize = 13.sp)
+                Text(location, color = Muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (!repo.openExternally(file)) {
+                    Toast.makeText(context, "No app on this phone can open this file", Toast.LENGTH_SHORT).show()
+                }
+            }) { Text("Open", fontWeight = FontWeight.SemiBold) }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { confirmDelete = true }) { Text("Delete", color = DangerRed) }
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
+        },
+    )
 }
